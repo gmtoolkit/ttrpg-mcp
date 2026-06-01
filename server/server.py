@@ -701,6 +701,122 @@ def get_daggerheart_entry(name: str, category: str = "") -> str:
     return _get_entry_collection(DH_COLLECTION, name, category)
 
 
+@mcp.tool()
+async def list_vaults() -> str:
+    """List your Obsidian vaults available for semantic search."""
+    user = _current_user.get()
+    if not user:
+        return "Not authenticated."
+    user_id = user.get("sub", "")
+    pool = await _get_db()
+    if not pool:
+        return "Database unavailable."
+    rows = await pool.fetch(
+        "SELECT name, doc_count, chunk_count, last_synced_at FROM vaults WHERE user_id = $1 ORDER BY name",
+        user_id,
+    )
+    if not rows:
+        return "No vaults found. Install the GMKit Obsidian plugin to sync your notes."
+    lines = ["**Your Obsidian Vaults:**", ""]
+    for r in rows:
+        synced = r["last_synced_at"].strftime("%Y-%m-%d") if r["last_synced_at"] else "never"
+        lines.append(f"- **{r['name']}** — {r['doc_count']} docs, {r['chunk_count']} chunks, last synced {synced}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_vault(query: str, vault_name: str = "", limit: int = 5) -> str:
+    """
+    Semantic search over your private Obsidian vault notes.
+
+    Only your own vaults are accessible — other users' notes are never returned.
+
+    Args:
+        query:      Natural language query, e.g. "session 3 dragon encounter notes"
+        vault_name: Vault to search (leave empty to search all your vaults)
+        limit:      Number of results to return (1-20, default 5)
+    """
+    start = time.perf_counter()
+    user = _current_user.get()
+    if not user:
+        return "Not authenticated."
+    user_id = user.get("sub", "")
+    limit = max(1, min(20, limit))
+
+    pool = await _get_db()
+    if not pool:
+        return "Database unavailable."
+
+    if vault_name:
+        rows = await pool.fetch(
+            "SELECT name, qdrant_collection FROM vaults WHERE user_id = $1 AND name ILIKE $2",
+            user_id, vault_name,
+        )
+        if not rows:
+            return f"Vault '{vault_name}' not found. Use list_vaults to see your available vaults."
+    else:
+        rows = await pool.fetch(
+            "SELECT name, qdrant_collection FROM vaults WHERE user_id = $1 ORDER BY name",
+            user_id,
+        )
+        if not rows:
+            return "No vaults found. Install the GMKit Obsidian plugin to sync your notes."
+
+    vec_result = await asyncio.to_thread(
+        voyage.embed, [query], model=VOYAGE_MODEL, input_type="query"
+    )
+    vector = vec_result.embeddings[0]
+
+    async def _search_one(vname: str, collection: str):
+        return vname, await asyncio.to_thread(
+            qdrant.search,
+            collection_name=collection,
+            query_vector=vector,
+            limit=limit,
+            with_payload=True,
+        )
+
+    results = await asyncio.gather(
+        *[_search_one(r["name"], r["qdrant_collection"]) for r in rows],
+        return_exceptions=True,
+    )
+
+    all_hits = []
+    for res in results:
+        if isinstance(res, Exception):
+            continue
+        vname, hits = res
+        for h in hits:
+            all_hits.append((vname, h))
+    all_hits.sort(key=lambda x: x[1].score, reverse=True)
+    all_hits = all_hits[:limit]
+
+    latency = int((time.perf_counter() - start) * 1000)
+    tokens_in = _est_tokens(query)
+    tokens_out = _est_tokens(str(all_hits))
+    asyncio.create_task(_log_tool_call(user_id, "search_vault", tokens_in, tokens_out, latency))
+
+    if not all_hits:
+        return "No results found."
+
+    multi = len(rows) > 1
+    parts = []
+    for i, (vname, hit) in enumerate(all_hits, 1):
+        p     = hit.payload
+        title = p.get("title", p.get("name", p.get("file", "Untitled")))
+        path  = p.get("path", p.get("file", ""))
+        text  = p.get("text", "")
+        score = f"{hit.score:.3f}"
+        header = f"### {i}. {title} — score {score}"
+        if multi:
+            header += f" [{vname}]"
+        if path and path != title:
+            header += f"\n*{path}*"
+        parts.append(f"{header}\n\n{text}" if text else header)
+
+    return "\n\n".join(parts)
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request):
     return JSONResponse({"status": "ok"})

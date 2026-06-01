@@ -1,4 +1,4 @@
-app = "ttrpg-mcp"
+app = "pf2e-mcp"
 primary_region = "iad"
 
 [build]
